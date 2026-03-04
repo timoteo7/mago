@@ -54,6 +54,7 @@ use mago_codex::reference::SymbolReferences;
 use mago_database::Database;
 use mago_database::DatabaseReader;
 use mago_database::file::FileType;
+use mago_reporting::IssueCollection;
 use mago_database::watcher::DatabaseWatcher;
 use mago_database::watcher::WatchOptions;
 use mago_orchestrator::Orchestrator;
@@ -148,8 +149,36 @@ pub struct AnalyzeCommand {
     /// currently staged for commit and analyze only those files.
     ///
     /// Fails if not in a git repository.
-    #[arg(long, conflicts_with_all = ["path", "list_codes", "watch"])]
+    #[arg(long, conflicts_with_all = ["path", "list_codes", "watch", "staged_lines"])]
     pub staged: bool,
+
+    /// Only fix analysis issues in staged lines within staged files.
+    ///
+    /// This flag is designed for git pre-commit hooks to only fix issues in
+    /// lines that are staged for commit, preserving unstaged changes.
+    /// Requires --fix to be enabled.
+    ///
+    /// Fails if not in a git repository or if any staged file has unstaged changes.
+    #[arg(long, conflicts_with_all = ["staged", "path", "list_codes", "watch"])]
+    pub staged_lines: bool,
+
+    /// Do not re-stage modified files after fixing.
+    ///
+    /// By default, fixed files are re-staged automatically when using --staged-lines.
+    /// When this flag is used, the fixed changes will remain as unstaged changes.
+    #[arg(long, requires = "staged_lines")]
+    pub no_stage: bool,
+
+    /// Only fix analysis issues in lines changed in the last commit.
+    ///
+    /// This flag is similar to `--staged-lines` but operates on the files and lines
+    /// from the most recent commit instead of the staging area. This is useful when
+    /// you want to fix analysis issues only in your changes after committing.
+    /// Requires --fix to be enabled.
+    ///
+    /// Fails if not in a git repository.
+    #[arg(long, conflicts_with_all = ["staged", "staged_lines", "path", "list_codes", "watch"])]
+    pub last_commit: bool,
 
     /// Read the file content from stdin and use the given path for baseline and reporting.
     ///
@@ -265,6 +294,10 @@ impl AnalyzeCommand {
             }
 
             orchestrator.set_source_paths(staged_paths.iter().map(|p| p.to_string_lossy().to_string()));
+        } else if self.staged_lines {
+            return self.execute_staged_lines(configuration, color_choice, database, metadata, symbol_references);
+        } else if self.last_commit {
+            return self.execute_last_commit(configuration, color_choice, database, metadata, symbol_references);
         } else if !self.stdin_input && !self.path.is_empty() {
             stdin_input::set_source_paths_from_paths(&mut orchestrator, &self.path);
         }
@@ -329,6 +362,270 @@ impl AnalyzeCommand {
             tracing::trace!("Database dropped in {:?}.", drop_database_duration.unwrap_or_default());
             tracing::trace!("Orchestrator dropped in {:?}.", drop_orchestrator_duration.unwrap_or_default());
             tracing::trace!("Analyze command finished in {:?}.", start.elapsed());
+        }
+
+        Ok(exit_code)
+    }
+
+    /// Executes the analyze command with staged-lines fix mode.
+    ///
+    /// Only fixes analysis issues in lines that are staged for commit.
+    fn execute_staged_lines(
+        &self,
+        configuration: Configuration,
+        color_choice: ColorChoice,
+        prelude_database: Database<'static>,
+        metadata: CodebaseMetadata,
+        symbol_references: SymbolReferences,
+    ) -> Result<ExitCode, Error> {
+        let workspace = &configuration.source.workspace;
+
+        let mut orchestrator = create_orchestrator(&configuration, color_choice, false, true, false);
+        orchestrator.add_exclude_patterns(configuration.analyzer.excludes.iter());
+
+        // Get staged file paths
+        let staged_paths = git::get_staged_file_paths(workspace)?;
+        if staged_paths.is_empty() {
+            tracing::info!("No staged files to analyze.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Check for unstaged changes (required for fixing)
+        if self.baseline_reporting.reporting.fix {
+            git::ensure_staged_files_are_clean(workspace, &staged_paths)?;
+        }
+
+        // Override source paths to only staged files
+        orchestrator.set_source_paths(staged_paths.iter().map(|p| p.to_string_lossy().to_string()));
+
+        let mut database =
+            orchestrator.load_database(workspace, true, Some(prelude_database), None)?;
+
+        if !database.files().any(|f| f.file_type == FileType::Host) {
+            tracing::warn!("No files found to analyze.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let service = orchestrator.get_analysis_service(database.read_only(), metadata, symbol_references);
+        let analysis_result = service.run()?;
+
+        let mut issues = analysis_result.issues;
+        let read_db = database.read_only();
+        issues.filter_out_ignored(
+            &configuration.analyzer.ignore,
+            configuration.source.glob.to_database_settings(),
+            |file_id| read_db.get_ref(&file_id).ok().map(|f| f.name.to_string()),
+        );
+
+        // Filter issues to only those within staged line ranges
+        let mut filtered_issues = Vec::new();
+        for issue in issues.into_iter() {
+            let Some(primary_span) = issue.primary_span() else {
+                continue;
+            };
+
+            // Get the file for this issue
+            let file = match database.get_ref(&primary_span.file_id) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            // Get staged ranges for this file
+            let absolute_path = workspace.join(Path::new(file.name.as_ref()));
+            let canonical_path = absolute_path.canonicalize().unwrap_or(absolute_path);
+            let staged_path = match canonical_path.strip_prefix(workspace) {
+                Ok(p) => p.to_path_buf(),
+                Err(_) => continue,
+            };
+
+            let ranges = match git::get_staged_line_ranges(workspace, &staged_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if ranges.is_empty() {
+                continue;
+            }
+
+            let start_line = file.line_number(primary_span.start.offset);
+            let end_line = file.line_number(primary_span.end.offset);
+
+            // Check if issue overlaps with any staged range
+            let in_range = ranges.iter().any(|range| {
+                (range.start as u32) <= end_line && (range.end as u32) >= start_line
+            });
+
+            if in_range {
+                filtered_issues.push(issue);
+            }
+        }
+
+        // Create a new issue collection with filtered issues
+        let filtered_issue_collection = IssueCollection::from(filtered_issues);
+
+        let baseline = configuration.analyzer.baseline.as_deref();
+        let baseline_variant = configuration.analyzer.baseline_variant;
+        let processor = self.baseline_reporting.get_processor(
+            color_choice,
+            baseline,
+            baseline_variant,
+            configuration.editor_url.clone(),
+            configuration.analyzer.minimum_fail_level,
+        );
+
+        let (exit_code, changed_file_ids) = processor.process_issues(&orchestrator, &mut database, filtered_issue_collection)?;
+
+        // Re-stage modified files only if --no-stage is not set
+        if !self.no_stage && !changed_file_ids.is_empty() {
+            git::stage_files(workspace, &database, changed_file_ids.clone())?;
+            tracing::info!("Fixed and re-staged {} file(s).", changed_file_ids.len());
+        } else if self.no_stage && !changed_file_ids.is_empty() {
+            tracing::info!("Fixed {} file(s). Changes are unstaged (use 'git add' to stage).", changed_file_ids.len());
+        } else if changed_file_ids.is_empty() {
+            tracing::info!("No staged line fixes needed.");
+        }
+
+        Ok(exit_code)
+    }
+
+    /// Executes the analyze command with last-commit fix mode.
+    ///
+    /// Only fixes analysis issues in lines changed in the last commit.
+    fn execute_last_commit(
+        &self,
+        configuration: Configuration,
+        color_choice: ColorChoice,
+        prelude_database: Database<'static>,
+        metadata: CodebaseMetadata,
+        symbol_references: SymbolReferences,
+    ) -> Result<ExitCode, Error> {
+        let workspace = &configuration.source.workspace;
+
+        let mut orchestrator = create_orchestrator(&configuration, color_choice, false, true, false);
+        orchestrator.add_exclude_patterns(configuration.analyzer.excludes.iter());
+
+        // Get files from last commit with their change status
+        let commit_files = git::get_last_commit_files_with_status(workspace)?;
+        if commit_files.is_empty() {
+            tracing::info!("No files found in the last commit.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Filter to only PHP files
+        let php_extensions: Vec<&str> = configuration.source.extensions.iter().map(|s| s.as_str()).collect();
+        let filtered_files: Vec<(PathBuf, git::FileChangeType)> = commit_files
+            .into_iter()
+            .filter(|(p, _)| {
+                p.extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| php_extensions.contains(&ext))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if filtered_files.is_empty() {
+            tracing::info!("No PHP files found in the last commit.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Override source paths to only files from last commit
+        orchestrator.set_source_paths(filtered_files.iter().map(|(p, _)| p.to_string_lossy().to_string()));
+
+        let mut database =
+            orchestrator.load_database(workspace, true, Some(prelude_database), None)?;
+
+        if !database.files().any(|f| f.file_type == FileType::Host) {
+            tracing::warn!("No files found to analyze.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let service = orchestrator.get_analysis_service(database.read_only(), metadata, symbol_references);
+        let analysis_result = service.run()?;
+
+        let mut issues = analysis_result.issues;
+        let read_db = database.read_only();
+        issues.filter_out_ignored(
+            &configuration.analyzer.ignore,
+            configuration.source.glob.to_database_settings(),
+            |file_id| read_db.get_ref(&file_id).ok().map(|f| f.name.to_string()),
+        );
+
+        // Filter issues to only those within commit line ranges
+        let mut filtered_issues = Vec::new();
+        for issue in issues.into_iter() {
+            let Some(primary_span) = issue.primary_span() else {
+                continue;
+            };
+
+            // Get the file for this issue
+            let file = match database.get_ref(&primary_span.file_id) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            // Get the change type for this file
+            let absolute_path = workspace.join(Path::new(file.name.as_ref()));
+            let canonical_path = absolute_path.canonicalize().unwrap_or(absolute_path);
+            let commit_path = match canonical_path.strip_prefix(workspace) {
+                Ok(p) => p.to_path_buf(),
+                Err(_) => continue,
+            };
+
+            let change_type = filtered_files
+                .iter()
+                .find(|(p, _)| *p == commit_path)
+                .map(|(_, ct)| ct.clone())
+                .unwrap_or(git::FileChangeType::Modified);
+
+            // For new files, check all lines
+            // For modified files, check only lines in commit ranges
+            if change_type == git::FileChangeType::Added {
+                // New file - include all issues
+                filtered_issues.push(issue);
+                continue;
+            }
+
+            let ranges = match git::get_last_commit_line_ranges(workspace, &commit_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if ranges.is_empty() {
+                continue;
+            }
+
+            let start_line = file.line_number(primary_span.start.offset);
+            let end_line = file.line_number(primary_span.end.offset);
+
+            // Check if issue overlaps with any commit range
+            let in_range = ranges.iter().any(|range| {
+                (range.start as u32) <= end_line && (range.end as u32) >= start_line
+            });
+
+            if in_range {
+                filtered_issues.push(issue);
+            }
+        }
+
+        // Create a new issue collection with filtered issues
+        let filtered_issue_collection = IssueCollection::from(filtered_issues);
+
+        let baseline = configuration.analyzer.baseline.as_deref();
+        let baseline_variant = configuration.analyzer.baseline_variant;
+        let processor = self.baseline_reporting.get_processor(
+            color_choice,
+            baseline,
+            baseline_variant,
+            configuration.editor_url.clone(),
+            configuration.analyzer.minimum_fail_level,
+        );
+
+        let (exit_code, changed_file_ids) = processor.process_issues(&orchestrator, &mut database, filtered_issue_collection)?;
+
+        if !changed_file_ids.is_empty() {
+            tracing::info!("Fixed {} file(s) from the last commit.", changed_file_ids.len());
+        } else {
+            tracing::info!("No lines from the last commit needed fixing.");
         }
 
         Ok(exit_code)
