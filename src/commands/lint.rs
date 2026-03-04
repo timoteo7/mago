@@ -29,6 +29,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use bumpalo::Bump;
 use clap::ColorChoice;
 use clap::Parser;
 use colored::Colorize;
@@ -39,12 +40,16 @@ use mago_linter::rule::AnyRule;
 use mago_linter::rule_meta::RuleEntry;
 use mago_orchestrator::service::lint::LintMode;
 use mago_reporting::Level;
+use mago_text_edit::ApplyResult;
+use mago_text_edit::Safety;
+use mago_text_edit::TextEditor;
 
 use crate::commands::args::baseline_reporting::BaselineReportingArgs;
 use crate::config::Configuration;
 use crate::error::Error;
 use crate::utils::create_orchestrator;
 use crate::utils::git;
+use mago_orchestrator::merge::merge_formatted_lines;
 
 /// Command for linting PHP source code.
 ///
@@ -167,6 +172,23 @@ pub struct LintCommand {
     #[arg(long, conflicts_with_all = ["path", "list_rules", "explain"])]
     pub staged: bool,
 
+    /// Only fix lint issues in staged lines within staged files.
+    ///
+    /// This flag is designed for git pre-commit hooks to only fix issues in
+    /// lines that are staged for commit, preserving unstaged changes.
+    /// Requires --fix to be enabled.
+    ///
+    /// Fails if not in a git repository or if any staged file has unstaged changes.
+    #[arg(long, conflicts_with_all = ["staged", "path", "list_rules", "explain"])]
+    pub staged_lines: bool,
+
+    /// Do not re-stage modified files after fixing.
+    ///
+    /// By default, fixed files are re-staged automatically when using --staged-lines.
+    /// When this flag is used, the fixed changes will remain as unstaged changes.
+    #[arg(long, requires = "staged_lines")]
+    pub no_stage: bool,
+
     #[clap(flatten)]
     pub baseline_reporting: BaselineReportingArgs,
 }
@@ -216,6 +238,8 @@ impl LintCommand {
             }
 
             orchestrator.set_source_paths(staged_paths.iter().map(|p| p.to_string_lossy().to_string()));
+        } else if self.staged_lines {
+            return self.execute_staged_lines(configuration, color_choice);
         } else if !self.path.is_empty() {
             orchestrator.set_source_paths(self.path.iter().map(|p| p.to_string_lossy().to_string()));
         }
@@ -269,6 +293,199 @@ impl LintCommand {
         }
 
         Ok(exit_code)
+    }
+
+    /// Executes the lint command with staged-lines fix mode.
+    ///
+    /// Only fixes lint issues in lines that are staged for commit.
+    fn execute_staged_lines(&self, configuration: Configuration, color_choice: ColorChoice) -> Result<ExitCode, Error> {
+        let workspace = &configuration.source.workspace;
+
+        let mut orchestrator = create_orchestrator(&configuration, color_choice, self.pedantic, true, false);
+        orchestrator.add_exclude_patterns(configuration.linter.excludes.iter());
+
+        // Get staged file paths
+        let staged_paths = git::get_staged_file_paths(workspace)?;
+        if staged_paths.is_empty() {
+            tracing::info!("No staged files to lint.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Check for unstaged changes (required for fixing)
+        if self.baseline_reporting.reporting.fix {
+            git::ensure_staged_files_are_clean(workspace, &staged_paths)?;
+        }
+
+        let database = orchestrator.load_database(workspace, false, None)?;
+
+        // Determine safety threshold
+        let safety_threshold = if self.baseline_reporting.reporting.r#unsafe {
+            Safety::Unsafe
+        } else if self.baseline_reporting.reporting.potentially_unsafe {
+            Safety::PotentiallyUnsafe
+        } else {
+            Safety::Safe
+        };
+
+        // Process each file with line-level fixing
+        let mut changed_file_ids = Vec::new();
+        let mut skipped_files = 0;
+
+        for staged_path in &staged_paths {
+            // Get line ranges for this file
+            let ranges = git::get_staged_line_ranges(workspace, staged_path)?;
+
+            if ranges.is_empty() {
+                skipped_files += 1;
+                continue;
+            }
+
+            // Get file from database
+            let absolute_path = workspace.join(staged_path);
+            let canonical_path = absolute_path.canonicalize().unwrap_or(absolute_path);
+            let file = match database.get_by_path(&canonical_path) {
+                Ok(f) => f,
+                Err(_) => {
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+
+            // Get the lint service for this file
+            let service = orchestrator.get_lint_service(database.read_only());
+            let issues = service.lint_file(&file, LintMode::Full, None);
+
+            // Filter issues to only those within staged line ranges
+            let mut batches: Vec<(Option<String>, Vec<mago_text_edit::TextEdit>)> = Vec::new();
+
+            for issue in issues.into_iter() {
+                if issue.edits.is_empty() {
+                    continue;
+                }
+
+                let span = match issue.primary_span() {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let start_line = file.line_number(span.start.offset);
+                let end_line = file.line_number(span.end.offset);
+
+                // Check if issue overlaps with any staged range
+                let in_range = ranges.iter().any(|range| {
+                    (range.start as u32) <= end_line && (range.end as u32) >= start_line
+                });
+
+                if in_range {
+                    // Get edits for this file
+                    if let Some(edits) = issue.edits.get(&file.id) {
+                        batches.push((issue.code.clone(), edits.clone()));
+                    }
+                }
+            }
+
+            if batches.is_empty() {
+                skipped_files += 1;
+                continue;
+            }
+
+            // Apply fixes using TextEditor
+            let arena = Bump::new();
+            let mut editor = TextEditor::with_safety(&file.contents, safety_threshold);
+            let parser_settings = orchestrator.config.parser_settings;
+            let file_id = file.id;
+
+            let checker = |code: &str| -> bool {
+                use mago_syntax::parser::parse_file_content_with_settings;
+                !parse_file_content_with_settings(&arena, file_id, code, parser_settings).has_errors()
+            };
+
+            let mut applied_any = false;
+            for (rule_code, edits) in batches {
+                let rule_code = rule_code.as_deref().unwrap_or("unknown");
+                match editor.apply_batch(edits, Some(&checker)) {
+                    ApplyResult::Applied => {
+                        applied_any = true;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Skipped fix for rule `{}` when fixing staged lines in `{}`",
+                            rule_code,
+                            file.name.as_ref()
+                        );
+                    }
+                }
+            }
+
+            let fixed_content = editor.finish();
+
+            if !applied_any || fixed_content == file.contents {
+                skipped_files += 1;
+                continue;
+            }
+
+            // Extract fixed chunks within ranges and merge back
+            let fixed_lines: Vec<&str> = fixed_content.lines().collect();
+            let mut formatted_chunks: Vec<String> = Vec::with_capacity(ranges.len());
+            let mut successful_ranges = Vec::with_capacity(ranges.len());
+
+            for range in &ranges {
+                let start_idx = range.start.saturating_sub(1);
+                let end_idx = range.end.saturating_sub(1);
+
+                if start_idx >= fixed_lines.len() || end_idx >= fixed_lines.len() || start_idx > end_idx {
+                    continue;
+                }
+
+                let chunk_lines: Vec<&str> = fixed_lines[start_idx..=end_idx].iter().copied().collect();
+                let chunk_content = chunk_lines.join("\n");
+
+                formatted_chunks.push(chunk_content);
+                successful_ranges.push(*range);
+            }
+
+            if formatted_chunks.is_empty() {
+                skipped_files += 1;
+                continue;
+            }
+
+            // Merge the fixed chunks back into the original content
+            let merged_content = match merge_formatted_lines(&file.contents, &successful_ranges, formatted_chunks) {
+                Ok(content) => content,
+                Err(e) => {
+                    tracing::warn!("Failed to merge fixes in '{}': {}", file.name, e);
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+
+            if merged_content == file.contents {
+                skipped_files += 1;
+                continue;
+            }
+
+            // Write to file
+            if let Err(e) = std::fs::write(&canonical_path, &merged_content) {
+                tracing::warn!("Failed to write fixed content to '{}': {}", file.name, e);
+                continue;
+            }
+
+            changed_file_ids.push(file.id);
+        }
+
+        // Re-stage modified files only if --no-stage is not set
+        if !self.no_stage && !changed_file_ids.is_empty() {
+            git::stage_files(workspace, &database, changed_file_ids.clone())?;
+            tracing::info!("Fixed and re-staged {} file(s).", changed_file_ids.len());
+        } else if self.no_stage && !changed_file_ids.is_empty() {
+            tracing::info!("Fixed {} file(s). Changes are unstaged (use 'git add' to stage).", changed_file_ids.len());
+        } else if skipped_files > 0 {
+            tracing::info!("No staged line fixes needed ({} file(s) checked).", skipped_files);
+        } else {
+            tracing::info!("All staged lines are already lint-free.");
+        }
+
+        Ok(ExitCode::SUCCESS)
     }
 }
 

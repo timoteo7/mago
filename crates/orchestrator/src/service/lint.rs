@@ -2,6 +2,9 @@ use std::sync::Arc;
 
 use bumpalo::Bump;
 
+use crate::OrchestratorError;
+use crate::service::pipeline::StatelessParallelPipeline;
+use crate::service::pipeline::StatelessReducer;
 use mago_database::ReadDatabase;
 use mago_database::file::File;
 use mago_linter::Linter;
@@ -14,10 +17,6 @@ use mago_reporting::IssueCollection;
 use mago_semantics::SemanticsChecker;
 use mago_syntax::parser::parse_file_with_settings;
 use mago_syntax::settings::ParserSettings;
-
-use crate::OrchestratorError;
-use crate::service::pipeline::StatelessParallelPipeline;
-use crate::service::pipeline::StatelessReducer;
 
 /// Defines the different operational modes for the linter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

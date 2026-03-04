@@ -62,6 +62,7 @@ pub use error::OrchestratorError;
 
 pub mod config;
 pub mod error;
+pub mod merge;
 pub mod progress;
 pub mod service;
 

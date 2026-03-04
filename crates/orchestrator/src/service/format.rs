@@ -10,8 +10,10 @@ use mago_formatter::settings::FormatSettings;
 use mago_php_version::PHPVersion;
 use mago_syntax::error::ParseError;
 use mago_syntax::settings::ParserSettings;
+use std::borrow::Cow;
 
 use crate::error::OrchestratorError;
+use crate::merge::{LineRange, merge_formatted_lines};
 use crate::service::pipeline::StatelessParallelPipeline;
 use crate::service::pipeline::StatelessReducer;
 
@@ -67,6 +69,107 @@ impl FormatService {
                 }
             }
             Err(parse_error) => Ok(FileFormatStatus::FailedToParse(parse_error)),
+        }
+    }
+
+    /// Formats only specific line ranges within a file.
+    ///
+    /// This method extracts the specified line ranges, formats each chunk in isolation,
+    /// and merges the formatted chunks back into the original file content.
+    /// Lines outside the specified ranges remain unchanged.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - The file to format
+    /// * `arena` - A bump allocator for temporary allocations during formatting
+    /// * `ranges` - The line ranges to format (1-based, inclusive)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(FileFormatStatus::Unchanged)` if no changes were made
+    /// - `Ok(FileFormatStatus::Changed(String))` with the merged content if formatting was applied
+    /// - `Ok(FileFormatStatus::FailedToParse(ParseError))` if the file couldn't be parsed
+    /// - `Err(OrchestratorError)` if formatting failed for other reasons
+    ///
+    /// # Behavior
+    ///
+    /// - Empty ranges: Falls back to full file formatting via `format_file_in`
+    /// - Parse errors in chunks: Skips the problematic chunk and continues with others
+    /// - Merge errors: Returns `Unchanged` to avoid data loss
+    pub fn format_line_ranges(
+        self,
+        file: &File,
+        arena: &Bump,
+        ranges: &[LineRange],
+    ) -> Result<FileFormatStatus, OrchestratorError> {
+        // Handle empty ranges - format the entire file
+        if ranges.is_empty() {
+            return self.format_file_in(file, arena);
+        }
+
+        // Split file into lines for range extraction
+        let original_lines: Vec<&str> = file.contents.lines().collect();
+        let mut formatted_chunks: Vec<String> = Vec::with_capacity(ranges.len());
+        let mut successful_ranges: Vec<LineRange> = Vec::with_capacity(ranges.len());
+
+        // Create formatter for chunk formatting
+        let formatter =
+            Formatter::new(arena, self.php_version, self.settings).with_parser_settings(self.parser_settings);
+
+        // Process each range
+        for range in ranges {
+            // Convert to 0-based indices
+            let start_idx = range.start.saturating_sub(1);
+            let end_idx = range.end.saturating_sub(1);
+
+            // Bounds check
+            if start_idx >= original_lines.len() || end_idx >= original_lines.len() || start_idx > end_idx {
+                // Skip invalid range
+                continue;
+            }
+
+            // Extract lines for this range
+            let range_lines: Vec<&str> = original_lines[start_idx..=end_idx].iter().copied().collect();
+            let chunk_content = range_lines.join("\n");
+
+            // Create an ephemeral file for this chunk
+            let chunk_file = File::ephemeral(
+                Cow::Owned(format!("chunk_range_{}_{}", range.start, range.end)),
+                Cow::Owned(chunk_content),
+            );
+
+            // Format the chunk
+            match formatter.format_file(&chunk_file) {
+                Ok(formatted_content) => {
+                    formatted_chunks.push(formatted_content.to_string());
+                    successful_ranges.push(*range);
+                }
+                Err(_) => {
+                    // On parse error, skip this chunk and continue with others
+                    // This handles syntax errors gracefully
+                    continue;
+                }
+            }
+        }
+
+        // If no chunks were successfully formatted, return unchanged
+        if formatted_chunks.is_empty() {
+            return Ok(FileFormatStatus::Unchanged);
+        }
+
+        // Merge formatted chunks back into original content
+        match merge_formatted_lines(&file.contents, &successful_ranges, formatted_chunks) {
+            Ok(merged_content) => {
+                if merged_content == file.contents {
+                    Ok(FileFormatStatus::Unchanged)
+                } else {
+                    Ok(FileFormatStatus::Changed(merged_content))
+                }
+            }
+            Err(_) => {
+                // On merge error, return unchanged to avoid data loss
+                Ok(FileFormatStatus::Unchanged)
+            }
         }
     }
 
