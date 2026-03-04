@@ -41,6 +41,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use bumpalo::Bump;
 use clap::ColorChoice;
 use clap::Parser;
 
@@ -58,6 +59,8 @@ use crate::error::Error;
 use crate::utils;
 use crate::utils::create_orchestrator;
 use crate::utils::git;
+
+
 
 /// Command for formatting PHP source files according to style rules.
 ///
@@ -116,8 +119,54 @@ pub struct FormatCommand {
     /// Fails if:
     /// - Not in a git repository
     /// - A staged file has unstaged changes (would cause data loss)
-    #[arg(long, short = 's', conflicts_with_all = ["dry_run", "check", "stdin_input", "path"])]
+    #[arg(long, short = 's', conflicts_with_all = ["dry_run", "check", "stdin_input", "path", "staged_lines"])]
     pub staged: bool,
+
+    /// Format only the staged lines in staged files.
+    ///
+    /// This flag is similar to `--staged` but only formats the specific lines
+    /// that are staged for commit, rather than entire files. This is useful when
+    /// you have unstaged changes in the same file that you don't want to include
+    /// in the formatting.
+    ///
+    /// The command will:
+    /// 1. Find all staged PHP files
+    /// 2. For each file, get the specific line ranges that are staged
+    /// 3. Format only those line ranges
+    /// 4. Merge the formatted lines back with the rest of the file
+    /// 5. Re-stage the modified files
+    ///
+    /// Fails if:
+    /// - Not in a git repository
+    /// - A staged file has unstaged changes (would cause data loss)
+    #[arg(long, conflicts_with_all = ["dry_run", "check", "stdin_input", "path", "staged"])]
+    pub staged_lines: bool,
+
+    /// Do not re-stage modified files after formatting.
+    ///
+    /// By default, formatted files are re-staged automatically when using --staged-lines.
+    /// When this flag is used, the formatted changes will remain as unstaged changes.
+    #[arg(long, requires = "staged_lines")]
+    pub no_stage: bool,
+
+    /// Format only the lines changed in the last commit.
+    ///
+    /// This flag is similar to `--staged-lines` but operates on the files and lines
+    /// from the most recent commit instead of the staging area. This is useful when
+    /// you want to format only your changes after committing, separating your code
+    /// style from the formatter's changes.
+    ///
+    /// The command will:
+    /// 1. Find all files changed in the last commit
+    /// 2. For each file, get the specific line ranges that were modified
+    /// 3. Format only those line ranges
+    /// 4. Merge the formatted lines back with the rest of the file
+    ///
+    /// Fails if:
+    /// - Not in a git repository
+    /// - No commit history (empty repository)
+    #[arg(long, conflicts_with_all = ["dry_run", "check", "stdin_input", "path", "staged", "staged_lines"])]
+    pub last_commit: bool,
 }
 
 impl FormatCommand {
@@ -157,6 +206,13 @@ impl FormatCommand {
             return self.execute_staged(configuration, color_choice);
         }
 
+        if self.staged_lines {
+            return self.execute_staged_lines(configuration, color_choice);
+        }
+
+        if self.last_commit {
+            return self.execute_last_commit(configuration, color_choice);
+        }
         let mut orchestrator = create_orchestrator(&configuration, color_choice, false, true, false);
         orchestrator.add_exclude_patterns(configuration.formatter.excludes.iter());
         if !self.path.is_empty() {
@@ -296,6 +352,229 @@ impl FormatCommand {
         git::stage_files(workspace, &database, changed_file_ids)?;
 
         tracing::info!("Formatted and re-staged {changed_files_count} file(s).");
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Executes formatting for only the staged lines in staged files.
+    ///
+    /// This method implements the `--staged-lines` mode for git pre-commit hooks:
+    ///
+    /// 1. Verifies we're in a git repository
+    /// 2. Gets the list of staged PHP files
+    /// 3. Checks that no staged files have unstaged changes
+    /// 4. For each staged file, gets the specific line ranges that are staged
+    /// 5. Formats only those line ranges (not entire files)
+    /// 6. Merges the formatted lines back into the original files
+    /// 7. Re-stages the modified files
+    ///
+    /// # Arguments
+    ///
+    /// * `configuration` - The configuration containing formatter settings
+    /// * `color_choice` - Whether to use colored output
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(ExitCode::SUCCESS)` if formatting succeeded
+    /// - `Err(Error::NotAGitRepository)` if not in a git repository
+    /// - `Err(Error::StagedFileHasUnstagedChanges)` if a file has partial staging
+    fn execute_staged_lines(self, configuration: Configuration, _color_choice: ColorChoice) -> Result<ExitCode, Error> {
+        let workspace = &configuration.source.workspace;
+
+        let mut orchestrator = create_orchestrator(&configuration, ColorChoice::Never, false, true, false);
+        orchestrator.add_exclude_patterns(configuration.formatter.excludes.iter());
+
+        // Get staged file paths
+        let staged_paths = git::get_staged_file_paths(workspace)?;
+        if staged_paths.is_empty() {
+            tracing::info!("No staged files to format.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Check for unstaged changes
+        git::ensure_staged_files_are_clean(workspace, &staged_paths)?;
+
+        // Override source paths to only staged files
+        orchestrator.set_source_paths(staged_paths.iter().map(|p| p.to_string_lossy().to_string()));
+
+        let database = orchestrator.load_database(workspace, false, None, None)?;
+
+        // Process each file with line-level formatting
+        let mut changed_file_ids = Vec::new();
+        let mut skipped_files = 0;
+
+        for staged_path in &staged_paths {
+            // Get line ranges for this file
+            let ranges = git::get_staged_line_ranges(workspace, staged_path)?;
+            if ranges.is_empty() {
+                skipped_files += 1;
+                continue;
+            }
+
+            // Get file from database
+            let absolute_path = workspace.join(staged_path);
+            let canonical_path = absolute_path.canonicalize().unwrap_or(absolute_path);
+            let file = match database.get_by_path(&canonical_path) {
+                Ok(f) => f,
+                Err(_) => {
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+
+            // Format only the staged lines
+            let arena = Bump::new();
+            let service = orchestrator.get_format_service(database.read_only());
+            match service.format_line_ranges(&file, &arena, ranges.as_slice()) {
+                Ok(FileFormatStatus::Changed(new_content)) => {
+                    // Write to file
+                    if let Err(e) = std::fs::write(&canonical_path, &new_content) {
+                        tracing::warn!("Failed to write formatted content to '{}': {}", file.name, e);
+                        continue;
+                    }
+                    changed_file_ids.push(file.id);
+                }
+                Ok(FileFormatStatus::Unchanged) => {
+                    // File is already formatted, no action needed
+                }
+                Ok(FileFormatStatus::FailedToParse(parse_error)) => {
+                    tracing::error!("Failed to parse file '{}': {}", file.name, parse_error);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to format staged lines in '{}': {}", file.name, e);
+                }
+            }
+        }
+
+        // Re-stage modified files only if --no-stage is not set
+        if !self.no_stage && !changed_file_ids.is_empty() {
+            git::stage_files(workspace, &database, changed_file_ids.clone())?;
+            tracing::info!("Formatted and re-staged {} file(s).", changed_file_ids.len());
+        } else if self.no_stage && !changed_file_ids.is_empty() {
+            tracing::info!("Formatted {} file(s). Changes are unstaged (use 'git add' to stage).", changed_file_ids.len());
+        } else if skipped_files > 0 {
+            tracing::info!("No staged lines needed formatting ({} file(s) checked).", skipped_files);
+        } else {
+            tracing::info!("All staged lines are already formatted.");
+        }
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Executes formatting for only the lines changed in the last commit.
+    ///
+    /// This method implements the `--last-commit` mode:
+    ///
+    /// 1. Verifies we're in a git repository
+    /// 2. Gets the list of files changed in the last commit
+    /// 3. For each file, gets the specific line ranges that were modified
+    /// 4. Formats only those line ranges (not entire files)
+    /// 5. Merges the formatted lines back into the original files
+    ///
+    /// # Arguments
+    ///
+    /// * `configuration` - The configuration containing formatter settings
+    /// * `color_choice` - Whether to use colored output
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(ExitCode::SUCCESS)` if formatting succeeded
+    /// - `Err(Error::NotAGitRepository)` if not in a git repository
+    fn execute_last_commit(self, configuration: Configuration, _color_choice: ColorChoice) -> Result<ExitCode, Error> {
+        let workspace = &configuration.source.workspace;
+
+        let mut orchestrator = create_orchestrator(&configuration, ColorChoice::Never, false, true, false);
+        orchestrator.add_exclude_patterns(configuration.formatter.excludes.iter());
+
+        // Get files from last commit with their change status
+        let commit_files = git::get_last_commit_files_with_status(workspace)?;
+        if commit_files.is_empty() {
+            tracing::info!("No files found in the last commit.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Filter to only PHP files (or whatever extensions are configured)
+        let php_extensions: Vec<&str> = configuration.source.extensions.iter().map(|s| s.as_str()).collect();
+        let filtered_files: Vec<(PathBuf, git::FileChangeType)> = commit_files
+            .into_iter()
+            .filter(|(p, _)| {
+                p.extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| php_extensions.contains(&ext))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if filtered_files.is_empty() {
+            tracing::info!("No PHP files found in the last commit.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Override source paths to only files from last commit
+        orchestrator.set_source_paths(filtered_files.iter().map(|(p, _)| p.to_string_lossy().to_string()));
+
+        let database = orchestrator.load_database(workspace, false, None, None)?;
+
+        // Process each file with line-level formatting
+        let mut changed_file_ids = Vec::new();
+        let mut skipped_files = 0;
+
+        for (commit_path, change_type) in &filtered_files {
+            // For new files, format the entire file
+            // For modified files, format only the changed lines (with small context)
+            let ranges = if *change_type == git::FileChangeType::Added {
+                Vec::new() // Empty ranges = format entire file
+            } else {
+                git::get_last_commit_line_ranges(workspace, commit_path)?
+            };
+
+            if ranges.is_empty() && *change_type != git::FileChangeType::Added {
+                skipped_files += 1;
+                continue;
+            }
+
+            // Get file from database
+            let absolute_path = workspace.join(commit_path);
+            let canonical_path = absolute_path.canonicalize().unwrap_or(absolute_path);
+            let file = match database.get_by_path(&canonical_path) {
+                Ok(f) => f,
+                Err(_) => {
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+
+            // Format only the changed lines (or entire file for new files)
+            let arena = Bump::new();
+            let service = orchestrator.get_format_service(database.read_only());
+            match service.format_line_ranges(&file, &arena, ranges.as_slice()) {
+                Ok(FileFormatStatus::Changed(new_content)) => {
+                    // Write to file
+                    if let Err(e) = std::fs::write(&canonical_path, &new_content) {
+                        tracing::warn!("Failed to write formatted content to '{}': {}", file.name, e);
+                        continue;
+                    }
+                    changed_file_ids.push(file.id);
+                }
+                Ok(FileFormatStatus::Unchanged) => {
+                    // File is already formatted, no action needed
+                }
+                Ok(FileFormatStatus::FailedToParse(parse_error)) => {
+                    tracing::error!("Failed to parse file '{}': {}", file.name, parse_error);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to format last commit lines in '{}': {}", file.name, e);
+                }
+            }
+        }
+
+        if !changed_file_ids.is_empty() {
+            tracing::info!("Formatted {} file(s) from the last commit.", changed_file_ids.len());
+        } else if skipped_files > 0 {
+            tracing::info!("No lines from the last commit needed formatting ({} file(s) checked).", skipped_files);
+        } else {
+            tracing::info!("All lines from the last commit are already formatted.");
+        }
 
         Ok(ExitCode::SUCCESS)
     }

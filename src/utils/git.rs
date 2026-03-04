@@ -4,6 +4,8 @@
 //! specifically for the `--staged` formatting feature that allows formatting
 //! staged files in pre-commit hooks.
 
+use unidiff::PatchSet;
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ use mago_database::Database;
 use mago_database::DatabaseReader;
 use mago_database::error::DatabaseError;
 use mago_database::file::FileId;
+use mago_orchestrator::merge::LineRange;
 
 use crate::error::Error;
 
@@ -231,4 +234,313 @@ fn get_files_with_unstaged_changes(workspace: &Path) -> Result<HashSet<PathBuf>,
         .map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
 
     Ok(String::from_utf8_lossy(&output.stdout).lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+}
+
+
+/// Get the line ranges of staged changes for a specific file.
+///
+/// This function runs `git diff --cached --unified=0 --diff-filter=ACMR -- <file>`
+/// to get the diff of staged changes, then parses it to extract the line ranges
+/// that were modified.
+///
+/// # Arguments
+///
+/// * `workspace` - The git repository root directory
+/// * `file` - The file path relative to the workspace
+///
+/// # Returns
+///
+/// A vector of `LineRange` representing the modified line ranges in the staged version
+/// of the file, or an error if the git command fails.
+pub fn get_staged_line_ranges(workspace: &Path, file: &Path) -> Result<Vec<LineRange>, Error> {
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--unified=0", "--diff-filter=ACMR", "--"])
+        .arg(file)
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let diff_output = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_diff_hunks(&diff_output))
+}
+
+/// Parse unified diff output to extract line ranges.
+///
+/// This function uses the `unidiff` crate to parse the diff output and extract
+/// the `target_start` and `target_length` from each hunk, converting them to
+/// `LineRange` structs.
+///
+/// # Arguments
+///
+/// * `diff_output` - The unified diff output string
+///
+/// # Returns
+///
+/// A vector of `LineRange` representing the modified line ranges.
+/// Line numbers are 1-based (as returned by git diff).
+pub fn parse_diff_hunks(diff_output: &str) -> Vec<LineRange> {
+    let mut patch_set = PatchSet::new();
+    if patch_set.parse(diff_output).is_err() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    for file in patch_set.files() {
+        for hunk in file.hunks() {
+            let start = hunk.target_start;
+            let length = hunk.target_length;
+
+            // If length is 0, it means the hunk represents a deletion in the target
+            // (which shouldn't happen with --diff-filter=ACMR, but handle it)
+            if length == 0 {
+                continue;
+            }
+
+            // Calculate end line (inclusive)
+            let end = start + length - 1;
+
+            ranges.push(LineRange { start, end });
+        }
+    }
+
+    ranges
+}
+
+/// Represents the type of change for a file in git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChangeType {
+    /// File was added in the commit
+    Added,
+    /// File was modified in the commit
+    Modified,
+    /// File was deleted in the commit
+    Deleted,
+}
+
+/// Get files changed in the last commit with their change type.
+///
+/// This function runs `git diff-tree --no-commit-id --name-status -r HEAD` to get
+/// the list of files that were modified in the most recent commit, along with
+/// their change status (Added, Modified, Deleted).
+///
+/// # Arguments
+///
+/// * `workspace` - The git repository root directory
+///
+/// # Returns
+///
+/// A vector of tuples containing (path, change_type), or an error if git command fails
+/// or if there's no commit history.
+pub fn get_last_commit_files_with_status(
+    workspace: &Path,
+) -> Result<Vec<(PathBuf, FileChangeType)>, Error> {
+    if !is_git_repository(workspace) {
+        return Err(Error::NotAGitRepository);
+    }
+
+    // Check if HEAD exists (i.e., we have at least one commit)
+    let head_check = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
+
+    if !head_check.status.success() {
+        return Ok(Vec::new());
+    }
+
+    // Get files changed in last commit with status
+    let output = Command::new("git")
+        .args(["diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
+
+    if !output.status.success() {
+        // This happens on the first commit (no parent to diff against)
+        return Ok(Vec::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut result = Vec::new();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+        if parts.len() != 2 {
+            continue;
+        }
+
+        let status = parts[0].trim();
+        let path = parts[1].trim();
+
+        let change_type = match status.chars().next() {
+            Some('A') => FileChangeType::Added,
+            Some('M') => FileChangeType::Modified,
+            Some('D') => FileChangeType::Deleted,
+            Some('R') => FileChangeType::Modified, // Renamed files should be formatted
+            Some('C') => FileChangeType::Modified, // Copied files should be formatted
+            _ => FileChangeType::Modified,         // Default to modified for unknown statuses
+        };
+
+        result.push((PathBuf::from(path), change_type));
+    }
+
+    // Filter out deleted files
+    result.retain(|(_, change_type)| *change_type != FileChangeType::Deleted);
+
+    Ok(result)
+}
+
+/// Get file paths that were changed in the last commit.
+///
+/// This function runs `git diff-tree --no-commit-id --name-only -r HEAD` to get
+/// the list of files that were modified in the most recent commit.
+///
+/// # Arguments
+///
+/// * `workspace` - The git repository root directory
+///
+/// # Returns
+///
+/// A vector of paths relative to the workspace, or an error if git command fails
+/// or if there's no commit history.
+pub fn get_last_commit_file_paths(workspace: &Path) -> Result<Vec<PathBuf>, Error> {
+    if !is_git_repository(workspace) {
+        return Err(Error::NotAGitRepository);
+    }
+
+    // Check if HEAD exists (i.e., we have at least one commit)
+    let head_check = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
+
+    if !head_check.status.success() {
+        return Ok(Vec::new());
+    }
+
+    // Get files changed in last commit
+    let output = Command::new("git")
+        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
+
+    if !output.status.success() {
+        // This happens on the first commit (no parent to diff against)
+        return Ok(Vec::new());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+}
+
+/// Get the line ranges of changes in the last commit for a specific file.
+///
+/// This function runs `git diff HEAD~1 HEAD --unified=0 -- <file>` to get the diff
+/// of changes made in the last commit, then parses it to extract the line ranges.
+///
+/// # Arguments
+///
+/// * `workspace` - The git repository root directory
+/// * `file` - The file path relative to the workspace
+///
+/// # Returns
+///
+/// A vector of `LineRange` representing the modified line ranges in the last commit
+/// version of the file, or an error if the git command fails.
+pub fn get_last_commit_line_ranges(workspace: &Path, file: &Path) -> Result<Vec<LineRange>, Error> {
+    if !is_git_repository(workspace) {
+        return Ok(Vec::new());
+    }
+
+    // Check if HEAD~1 exists
+    let head_check = Command::new("git")
+        .args(["rev-parse", "HEAD~1"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
+
+    if !head_check.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let output = Command::new("git")
+        .args(["diff", "HEAD~1", "HEAD", "--unified=0", "--"])
+        .arg(file)
+        .current_dir(workspace)
+        .output()
+        .map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let diff_output = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_diff_hunks(&diff_output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_diff_hunks_single_hunk() {
+        let diff = r#"diff --git a/test.php b/test.php
+index 1234567..abcdefg 100644
+--- a/test.php
++++ b/test.php
+@@ -10,3 +10,4 @@ class Test
+     public function test() {
++        // new line
+         return true;
+         }
+"#;
+
+        let ranges = parse_diff_hunks(diff);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], LineRange { start: 10, end: 13 });
+    }
+
+    #[test]
+    fn test_parse_diff_hunks_multiple_hunks() {
+        let diff = r#"diff --git a/test.php b/test.php
+index 1234567..abcdefg 100644
+--- a/test.php
++++ b/test.php
+@@ -5,2 +5,3 @@ namespace App;
++use stdClass;
++
+@@ -20,1 +21,2 @@ class Test
++        // added
+     }
+"#;
+
+        let ranges = parse_diff_hunks(diff);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], LineRange { start: 5, end: 7 });
+        assert_eq!(ranges[1], LineRange { start: 21, end: 22 });
+    }
+
+    #[test]
+    fn test_parse_diff_hunks_empty_diff() {
+        let diff = "";
+        let ranges = parse_diff_hunks(diff);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_parse_diff_hunks_no_changes() {
+        let diff = "No changes\n";
+        let ranges = parse_diff_hunks(diff);
+        assert!(ranges.is_empty());
+    }
 }

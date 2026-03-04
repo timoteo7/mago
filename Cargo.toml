@@ -157,6 +157,7 @@ unicode-width = { workspace = true }
 notify = { workspace = true }
 dhat = { workspace = true, optional = true }
 schemars = { workspace = true }
+unidiff = "0.4"
 
 [dev-dependencies]
 temp-env = "0.3.6"

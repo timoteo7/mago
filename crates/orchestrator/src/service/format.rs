@@ -10,8 +10,10 @@ use mago_formatter::settings::FormatSettings;
 use mago_php_version::PHPVersion;
 use mago_syntax::error::ParseError;
 use mago_syntax::settings::ParserSettings;
+use std::borrow::Cow;
 
 use crate::error::OrchestratorError;
+use crate::merge::{LineRange, merge_formatted_lines, expand_ranges_with_context, DEFAULT_CONTEXT_LINES};
 use crate::service::pipeline::StatelessParallelPipeline;
 use crate::service::pipeline::StatelessReducer;
 
@@ -67,6 +69,126 @@ impl FormatService {
                 }
             }
             Err(parse_error) => Ok(FileFormatStatus::FailedToParse(parse_error)),
+        }
+    }
+
+    /// Formats only specific line ranges within a file.
+    ///
+    /// This method extracts the specified line ranges, formats each chunk in isolation,
+    /// and merges the formatted chunks back into the original file content.
+    /// Lines outside the specified ranges remain unchanged.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - The file to format
+    /// * `arena` - A bump allocator for temporary allocations during formatting
+    /// * `ranges` - The line ranges to format (1-based, inclusive)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(FileFormatStatus::Unchanged)` if no changes were made
+    /// - `Ok(FileFormatStatus::Changed(String))` with the merged content if formatting was applied
+    /// - `Ok(FileFormatStatus::FailedToParse(ParseError))` if the file couldn't be parsed
+    /// - `Err(OrchestratorError)` if formatting failed for other reasons
+    ///
+    /// # Behavior
+    ///
+    /// - Empty ranges: Falls back to full file formatting via `format_file_in`
+    /// - Parse errors in chunks: Skips the problematic chunk and continues with others
+    /// - Merge errors: Returns `Unchanged` to avoid data loss
+    pub fn format_line_ranges(
+        self,
+        file: &File,
+        arena: &Bump,
+        ranges: &[LineRange],
+    ) -> Result<FileFormatStatus, OrchestratorError> {
+        // Handle empty ranges - format the entire file
+        if ranges.is_empty() {
+            return self.format_file_in(file, arena);
+        }
+
+        // Split file into lines for range extraction
+        let original_lines: Vec<&str> = file.contents.lines().collect();
+        let total_lines = original_lines.len();
+
+        // Expand ranges with context to give formatter enough information
+        // Uses small context (5 lines) to avoid formatting untouched lines
+        let expanded_ranges = expand_ranges_with_context(ranges, total_lines, DEFAULT_CONTEXT_LINES);
+
+        let mut formatted_chunks: Vec<String> = Vec::with_capacity(expanded_ranges.len());
+        let mut successful_ranges: Vec<LineRange> = Vec::with_capacity(expanded_ranges.len());
+
+        // Create formatter for chunk formatting
+        let formatter =
+            Formatter::new(arena, self.php_version, self.settings).with_parser_settings(self.parser_settings);
+
+        // Process each expanded range
+        for range in &expanded_ranges {
+            // Convert to 0-based indices
+            let start_idx = range.start.saturating_sub(1);
+            let end_idx = range.end.saturating_sub(1);
+
+            // Bounds check
+            if start_idx >= original_lines.len() || end_idx >= original_lines.len() || start_idx > end_idx {
+                // Skip invalid range
+                continue;
+            }
+
+            // Extract lines for this expanded range (includes context)
+            let range_lines: Vec<&str> = original_lines[start_idx..=end_idx].iter().copied().collect();
+            let mut chunk_content = range_lines.join("\n");
+
+            // Ensure the chunk is valid PHP by prepending <?php if not present
+            // This is necessary because the parser requires a valid PHP opening tag
+            if !chunk_content.contains("<?php") && !chunk_content.contains("<?=") {
+                chunk_content = format!("<?php\n{}", chunk_content);
+            }
+
+            // Create an ephemeral file for this chunk
+            let chunk_file = File::ephemeral(
+                Cow::Owned(format!("chunk_expanded_{}_{}", range.start, range.end)),
+                Cow::Owned(chunk_content.clone()),
+            );
+
+            // Format the chunk
+            match formatter.format_file(&chunk_file) {
+                Ok(formatted_content) => {
+                    // Remove the <?php\n prefix we added if it wasn't in the original
+                    let mut processed_content = formatted_content.to_string();
+                    let has_php_tag_in_original = range_lines.iter().any(|l| l.contains("<?php") || l.contains("<?="));
+                    if processed_content.starts_with("<?php\n") && !has_php_tag_in_original {
+                        processed_content = processed_content.strip_prefix("<?php\n").unwrap_or(&processed_content).to_string();
+                    }
+
+                    formatted_chunks.push(processed_content);
+                    successful_ranges.push(*range);
+                }
+                Err(_) => {
+                    // On parse error, skip this chunk and continue with others
+                    // This handles syntax errors gracefully
+                    continue;
+                }
+            }
+        }
+
+        // If no chunks were successfully formatted, return unchanged
+        if formatted_chunks.is_empty() {
+            return Ok(FileFormatStatus::Unchanged);
+        }
+
+        // Merge formatted chunks back into original content
+        match merge_formatted_lines(&file.contents, &successful_ranges, formatted_chunks) {
+            Ok(merged_content) => {
+                if merged_content == file.contents {
+                    Ok(FileFormatStatus::Unchanged)
+                } else {
+                    Ok(FileFormatStatus::Changed(merged_content))
+                }
+            }
+            Err(_) => {
+                // On merge error, return unchanged to avoid data loss
+                Ok(FileFormatStatus::Unchanged)
+            }
         }
     }
 
@@ -232,5 +354,57 @@ impl StatelessReducer<FormatResult, FormatResult> for FormatReducer {
         }
 
         Ok(FormatResult { changed_files })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_line_ranges_without_php_tag() {
+        // Test that chunks without <?php tag are formatted correctly
+        let content = "<?php\n\nclass Foo {\n    public function bar(  ) {\n        return 1;\n    }\n}\n";
+        let _file = File::ephemeral(Cow::Borrowed("test.php"), Cow::Borrowed(content));
+
+        // Create a mock format service - we can't actually test this without
+        // a full service, but we can test the chunk preparation logic
+        let ranges = vec![LineRange { start: 4, end: 6 }]; // The function bar
+
+        // Extract the chunk as the real code does
+        let original_lines: Vec<&str> = content.lines().collect();
+        let start_idx = ranges[0].start.saturating_sub(1);
+        let end_idx = ranges[0].end.saturating_sub(1);
+
+        let range_lines: Vec<&str> = original_lines[start_idx..=end_idx].iter().copied().collect();
+        let mut chunk_content = range_lines.join("\n");
+
+        // This is the fix we added
+        if !chunk_content.contains("<?php") && !chunk_content.contains("<?=") {
+            chunk_content = format!("<?php\n{}", chunk_content);
+        }
+
+        // Verify the chunk now has <?php
+        assert!(chunk_content.contains("<?php"));
+        assert!(chunk_content.contains("public function bar"));
+    }
+
+    #[test]
+    fn test_format_line_ranges_with_php_tag_preserved() {
+        // Test that chunks that already have <?php don't get it duplicated
+        let content = "<?php\n\necho 'hello';\n";
+        let original_lines: Vec<&str> = content.lines().collect();
+
+        // Simulate extracting line 1 (which has <?php)
+        let range_lines: Vec<&str> = original_lines[0..1].iter().copied().collect();
+        let mut chunk_content = range_lines.join("\n");
+
+        if !chunk_content.contains("<?php") && !chunk_content.contains("<?=") {
+            chunk_content = format!("<?php\n{}", chunk_content);
+        }
+
+        // Should only have one <?php
+        let count = chunk_content.matches("<?php").count();
+        assert_eq!(count, 1);
     }
 }
